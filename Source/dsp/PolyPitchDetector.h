@@ -91,6 +91,7 @@ public:
         numConfiguredStrings = activeStrings.count;
         lastA4Ref            = clampedA4;
 
+        std::array<float, kMaxStrings> baseFreqs {};
         for (int i = 0; i < numConfiguredStrings; ++i)
         {
             const auto idx       = static_cast<std::size_t> (i);
@@ -100,22 +101,58 @@ public:
             // В полифоническом режиме ищутся ноты строго так, как они прописаны в пресете (с учётом Sweetener)
             const float targetMidi = static_cast<float> (activeStrings.midiNotes[idx])
                                    + (activeStrings.centOffsets[idx] * 0.01f);
-            const float targetHz   = clampedA4 * std::pow (2.0f, (targetMidi - 69.0f) / 12.0f);
+            baseFreqs[idx]         = clampedA4 * std::pow (2.0f, (targetMidi - 69.0f) / 12.0f);
+        }
 
-            // Частота 2-й гармоники струны s-2 (если есть), которая попадает на +200 центов выше струны s
-            // (например, 2-я гармоника 6-й струны E2/D#2 рядом с 4-й струной D3/C#3,
-            //  и 2-я гармоника 5-й струны A2/G#2 рядом с 3-й струной G3/F#3).
-            float notchFreqHz = targetHz * 2.0f;
-            if (i >= 2)
+        for (int i = 0; i < numConfiguredStrings; ++i)
+        {
+            const auto idx      = static_cast<std::size_t> (i);
+            const float baseHz  = baseFreqs[idx];
+
+            // Проверяем, не совпадает ли основной тон струны s (1*f_s) с мощной 3-й или 4-й гармоникой
+            // нижележащей толстой струны (например, 2-я струна B3/A#3 совпадает с 3-й гармоникой 6-й струны E2/D#2,
+            // а 1-я струна E4/D#4 совпадает с 4-й гармоникой 6-й струны и 3-й гармоникой 5-й струны).
+            // Для таких верхних струн отслеживаем их 2-ю гармонику (2*f_s), которая свободна от 3*f6 и 4*f6!
+            int harmOrder       = 1;
+            int colliding3xIdx  = -1;
+            float resonatorQ    = 18.0f;
+
+            for (int low = 0; low < i; ++low)
             {
-                const float low2Midi = static_cast<float> (activeStrings.midiNotes[static_cast<std::size_t> (i - 2)])
-                                     + (activeStrings.centOffsets[static_cast<std::size_t> (i - 2)] * 0.01f);
-                const float low2Harm2 = 2.0f * clampedA4 * std::pow (2.0f, (low2Midi - 69.0f) / 12.0f);
-                if (low2Harm2 > targetHz * 1.07f && low2Harm2 < targetHz * 1.25f)
-                    notchFreqHz = low2Harm2;
+                const float ratio = baseHz / baseFreqs[static_cast<std::size_t> (low)];
+                if (std::abs (ratio - 3.0f) < 0.035f)
+                {
+                    harmOrder      = 2;
+                    colliding3xIdx = low; // 2-я струна: на частоте 2*f2 может мешать только 6*f6 при расстроенной 6-й струне
+                    resonatorQ     = 15.0f;
+                    break;
+                }
+                if (std::abs (ratio - 4.0f) < 0.035f)
+                {
+                    harmOrder  = 2; // 1-я струна: отслеживаем 2*f1 (622..659 Гц), свободную от 4*f6 и 3*f5
+                    resonatorQ = 20.0f;
+                    break;
+                }
             }
 
-            channels[idx].configure (targetHz, notchFreqHz, decimatedFs);
+            const float effectiveHz = baseHz * static_cast<float> (harmOrder);
+            float notchFreqHz       = effectiveHz * 2.0f;
+
+            if (harmOrder == 1 && i >= 2)
+            {
+                // Для струн 4 и 3 режем 2-ю гармонику струны s-2 (+200 центов выше основного тона)
+                const float low2Harm2 = 2.0f * baseFreqs[static_cast<std::size_t> (i - 2)];
+                if (low2Harm2 > effectiveHz * 1.07f && low2Harm2 < effectiveHz * 1.25f)
+                    notchFreqHz = low2Harm2;
+            }
+            else if (harmOrder == 2 && i >= 1)
+            {
+                // Для 1-й струны (2*f1 = 622..659 Гц) режем 3-ю гармонику 2-й струны (3*f2 = 699..740 Гц, +200 центов выше)
+                // Для 2-й струны (2*f2 = 466..494 Гц) по умолчанию режем 3-ю гармонику 3-й струны (3*f3 = 555..588 Гц)
+                notchFreqHz = 3.0f * baseFreqs[static_cast<std::size_t> (i - 1)];
+            }
+
+            channels[idx].configure (baseHz, notchFreqHz, harmOrder, colliding3xIdx, resonatorQ, decimatedFs);
         }
     }
 
@@ -137,11 +174,9 @@ public:
                 inputSqSum += filtered * filtered;
                 ++inputSamplesCount;
 
-                // Во время первых ~100 мс атаки медиатора фильтры продолжают обновлять состояния и энергию,
-                // но нестабильные стартовые периоды не записываются в кольцевой буфер периодов
-                const bool recordPeriods = (attackBlankFrames == 0);
+                const bool globalBlank = (attackBlankFrames > 0);
                 for (int s = 0; s < numConfiguredStrings; ++s)
-                    channels[static_cast<std::size_t> (s)].processSample (filtered, recordPeriods);
+                    channels[static_cast<std::size_t> (s)].processSample (filtered, globalBlank);
 
                 if (++samplesSinceUpdate >= updateIntervalSamples)
                 {
@@ -162,42 +197,47 @@ public:
 
 private:
     // Физическая компенсация негармоничности жёсткости гитарных струн (f_n = n * f_1 * sqrt(1 + B * n^2)):
-    // Широкополосный соло-тюнер (MPM / PolyTune) оценивает высоту тона с весом обертонов n = 2..5,
-    // тогда как узкополосный резонатор выделяет чистое основное колебание f_1, которое у витых струн
-    // физически лежит на 1.5..3.5 цента ниже гармонического центра тяжести.
-    [[nodiscard]] static constexpr float inharmOffsetCents (float freqHz) noexcept
+    // У витых струн (harmOrder == 1) основное колебание f_1 лежит на 1.6..3.4 цента ниже гармонического центра тяжести,
+    // а для тонких струн без обмотки (harmOrder == 2) замер уже ведётся direttamente на 2-й гармонике (2*f0).
+    [[nodiscard]] static constexpr float inharmOffsetCents (float baseFreqHz, int harmOrder) noexcept
     {
-        if (freqHz < 90.0f)  return 3.45f; // 6-я струна (E2 / D#2 / D2) и басовые струны
-        if (freqHz < 120.0f) return 2.80f; // 5-я струна (A2 / G#2)
-        if (freqHz < 160.0f) return 2.95f; // 4-я струна (D3 / C#3)
-        if (freqHz < 210.0f) return 1.65f; // 3-я струна (G3 / F#3)
-        return 1.00f;                      // 2-я и 1-я струны без обмотки (B3 / E4)
+        if (harmOrder > 1)       return 0.0f;  // 1-я и 2-я струны замеряются на 2-й гармонике
+        if (baseFreqHz < 90.0f)  return 3.45f; // 6-я струна (E2 / D#2 / D2) и басовые струны
+        if (baseFreqHz < 120.0f) return 2.80f; // 5-я струна (A2 / G#2)
+        if (baseFreqHz < 160.0f) return 2.95f; // 4-я струна (D3 / C#3)
+        if (baseFreqHz < 210.0f) return 1.65f; // 3-я струна (G3 / F#3)
+        return 1.00f;
     }
 
     struct ResonatorChannel
     {
-        // Кольцевой буфер на 32 полупериода (~16 полных периодов) усредняет фазовые биения аккорда
         static constexpr std::size_t kRingSize = 32;
 
+        float baseFreqHz     = 100.0f;
         float targetFreqHz   = 100.0f;
+        float sampleRateDec  = 24000.0f;
+        float defaultNotchHz = 200.0f;
+        int   harmOrder      = 1;
+        int   colliding3xIdx = -1;
+
         float expectedPeriod = 240.0f;
         float minValidPeriod = 230.0f;
         float maxValidPeriod = 250.0f;
         float inharmCents    = 0.0f;
 
-        // 0. Входной ФВЧ 1-го порядка (срезает нижние соседние струны и низкочастотный удар медиатора)
+        // 0. Входной ФВЧ 1-го порядка
         float hp_coeff = 0.98f;
         float hp_x1 = 0.0f, hp_y1 = 0.0f;
 
-        // 1. Заграждающий режекторный фильтр (Notch) на частоту главной помехи (+200 центов от 2-й гармоники струны s-2 или 2*f0)
+        // 1. Заграждающий режекторный фильтр (Notch)
         float nt_b0 = 1.0f, nt_b1 = 0.0f, nt_b2 = 1.0f, nt_a1 = 0.0f, nt_a2 = 0.0f;
         float nt_x1 = 0.0f, nt_x2 = 0.0f, nt_y1 = 0.0f, nt_y2 = 0.0f;
 
-        // 2. Канальный ФНЧ Баттерворта (срез 1.26 * targetFreqHz) для подавления верхних струн и обертонов
+        // 2. Канальный ФНЧ Баттерворта
         float lp_b0 = 0.0f, lp_b1 = 0.0f, lp_b2 = 0.0f, lp_a1 = 0.0f, lp_a2 = 0.0f;
         float lp_x1 = 0.0f, lp_x2 = 0.0f, lp_y1 = 0.0f, lp_y2 = 0.0f;
 
-        // 3. Трёхкаскадный узкополосный резонатор (Q = 18.0) с точным размещением полюсов
+        // 3. Трёхкаскадный узкополосный резонатор
         float bp_b0 = 0.0f, bp_b2 = 0.0f, bp_a1 = 0.0f, bp_a2 = 0.0f;
         float s1_x1 = 0.0f, s1_x2 = 0.0f, s1_y1 = 0.0f, s1_y2 = 0.0f;
         float s2_x1 = 0.0f, s2_x2 = 0.0f, s2_y1 = 0.0f, s2_y2 = 0.0f;
@@ -208,25 +248,29 @@ private:
         std::size_t ringCount    = 0;
         int newPeriodsInWindow   = 0;
 
-        float prevSample       = 0.0f;
-        int   samplesSincePos  = 0;
-        float prevPosFrac      = 0.0f;
-        bool  hasPosCross      = false;
+        float prevSample         = 0.0f;
+        int   samplesSincePos    = 0;
+        float prevPosFrac        = 0.0f;
+        bool  hasPosCross        = false;
 
-        int   samplesSinceNeg  = 0;
-        float prevNegFrac      = 0.0f;
-        bool  hasNegCross      = false;
+        int   samplesSinceNeg    = 0;
+        float prevNegFrac        = 0.0f;
+        bool  hasNegCross        = false;
 
-        float energySum        = 0.0f;
-        int   energySamples    = 0;
+        float energySum          = 0.0f;
+        int   energySamples      = 0;
 
-        float rawRmsSmooth     = 0.0f;
-        float smoothedCents    = 0.0f;
-        float smoothedEnergy   = 0.0f;
-        int   holdFrames       = 0;
-        int   lockAgeFrames    = 0;
-        bool  isLocked         = false;
-        bool  hasCentsInit     = false;
+        float rawRmsSmooth       = 0.0f;
+        float peakEnergy         = 0.0f;
+        int   framesSincePeak    = 100;
+        int   channelBlankFrames = 0;
+
+        float smoothedCents      = 0.0f;
+        float smoothedEnergy     = 0.0f;
+        int   holdFrames         = 0;
+        int   lockAgeFrames      = 0;
+        bool  isLocked           = false;
+        bool  hasCentsInit       = false;
 
         void reset() noexcept
         {
@@ -247,6 +291,9 @@ private:
             energySum          = 0.0f;
             energySamples      = 0;
             rawRmsSmooth       = 0.0f;
+            peakEnergy         = 0.0f;
+            framesSincePeak    = 100;
+            channelBlankFrames = 0;
             smoothedCents      = 0.0f;
             smoothedEnergy     = 0.0f;
             holdFrames         = 0;
@@ -263,28 +310,14 @@ private:
             newPeriodsInWindow = 0;
         }
 
-        void configure (float freqHz, float notchHz, float sampleRateDec) noexcept
+        void setNotchFilter (float notchHz, float qVal) noexcept
         {
-            targetFreqHz   = std::clamp (freqHz, 20.0f, sampleRateDec * 0.42f);
-            expectedPeriod = sampleRateDec / targetFreqHz;
-            inharmCents    = inharmOffsetCents (targetFreqHz);
-
-            // Допуск захвата периода струны +-55 центов
-            minValidPeriod = expectedPeriod * 0.9685f;
-            maxValidPeriod = expectedPeriod * 1.0325f;
-
-            constexpr float twoPi = std::numbers::pi_v<float> * 2.0f;
-
-            // 0. Входной ФВЧ на 0.78 * targetFreqHz (ослабляет соседнюю нижнюю струну на 0.749 * f0)
-            const float hpCutoff = std::clamp (targetFreqHz * 0.78f, 18.0f, sampleRateDec * 0.35f);
-            hp_coeff = std::exp (-twoPi * hpCutoff / sampleRateDec);
-
-            // 1. Узкий режекторный фильтр (Notch, Q = 8.0) точно на частоту помехи (2-я гармоника струны s-2 или 2*f0)
-            const float clampedNotch = std::clamp (notchHz, targetFreqHz * 1.08f, sampleRateDec * 0.44f);
+            constexpr float twoPi    = std::numbers::pi_v<float> * 2.0f;
+            const float clampedNotch = std::clamp (notchHz, 20.0f, sampleRateDec * 0.44f);
             const float ntOmega      = twoPi * clampedNotch / sampleRateDec;
             const float ntSn         = std::sin (ntOmega);
             const float ntCs         = std::cos (ntOmega);
-            const float ntAlpha      = ntSn / (2.0f * 8.0f);
+            const float ntAlpha      = ntSn / (2.0f * qVal);
             const float ntInvA0      = 1.0f / (1.0f + ntAlpha);
 
             nt_b0 = 1.0f * ntInvA0;
@@ -292,9 +325,41 @@ private:
             nt_b2 = 1.0f * ntInvA0;
             nt_a1 = nt_b1;
             nt_a2 = (1.0f - ntAlpha) * ntInvA0;
+        }
 
-            // 2. Канальный ФНЧ Баттерворта на 1.26 * targetFreqHz (режет соседнюю верхнюю струну 1.335*f0 и гармоники)
-            const float lpCutoff = std::clamp (targetFreqHz * 1.26f, 35.0f, sampleRateDec * 0.45f);
+        void configure (
+            float baseHz,
+            float notchHz,
+            int   harmonicMultiplier,
+            int   colliding3xStringIdx,
+            float resonatorQ,
+            float fsDec) noexcept
+        {
+            sampleRateDec  = fsDec;
+            baseFreqHz     = std::clamp (baseHz, 20.0f, sampleRateDec * 0.42f);
+            harmOrder      = std::max (1, harmonicMultiplier);
+            colliding3xIdx = colliding3xStringIdx;
+            targetFreqHz   = std::clamp (baseFreqHz * static_cast<float> (harmOrder), 20.0f, sampleRateDec * 0.42f);
+            defaultNotchHz = notchHz;
+
+            expectedPeriod = sampleRateDec / targetFreqHz;
+            inharmCents    = inharmOffsetCents (baseFreqHz, harmOrder);
+
+            // Допуск захвата периода струны +-55 центов
+            minValidPeriod = expectedPeriod * 0.9685f;
+            maxValidPeriod = expectedPeriod * 1.0325f;
+
+            constexpr float twoPi = std::numbers::pi_v<float> * 2.0f;
+
+            // 0. Входной ФВЧ на 0.80 * targetFreqHz
+            const float hpCutoff = std::clamp (targetFreqHz * 0.80f, 18.0f, sampleRateDec * 0.38f);
+            hp_coeff = std::exp (-twoPi * hpCutoff / sampleRateDec);
+
+            // 1. Режекторный фильтр (Notch) на частоту главной помехи
+            setNotchFilter (defaultNotchHz, (harmOrder > 1) ? 6.0f : 8.0f);
+
+            // 2. Канальный ФНЧ Баттерворта на 1.22 * targetFreqHz
+            const float lpCutoff = std::clamp (targetFreqHz * 1.22f, 35.0f, sampleRateDec * 0.45f);
             const float lpOmega  = twoPi * lpCutoff / sampleRateDec;
             const float lpSn     = std::sin (lpOmega);
             const float lpCs     = std::cos (lpOmega);
@@ -307,10 +372,9 @@ private:
             lp_a1 = (-2.0f * lpCs) * lpInvA0;
             lp_a2 = (1.0f - lpAlpha) * lpInvA0;
 
-            // 3. Трёхкаскадный резонатор с полюсами на omega0 (Q = 18.0)
-            constexpr float Q  = 18.0f;
+            // 3. Трёхкаскадный резонатор с полюсами на omega0
             const float omega0 = twoPi * targetFreqHz / sampleRateDec;
-            const float poleR  = std::exp (-omega0 / (2.0f * Q));
+            const float poleR  = std::exp (-omega0 / (2.0f * resonatorQ));
             const float poleR2 = poleR * poleR;
 
             bp_a1 = -2.0f * poleR * std::cos (omega0);
@@ -333,14 +397,16 @@ private:
             }
         }
 
-        void processSample (float x, bool recordPeriods) noexcept
+        void processSample (float x, bool globalBlank) noexcept
         {
+            const bool recordPeriods = (!globalBlank) && (channelBlankFrames == 0);
+
             // Ступень 0: ФВЧ отсечки нижних струн
             const float h0 = x - hp_x1 + hp_coeff * hp_y1;
             hp_x1 = x;
             hp_y1 = h0;
 
-            // Ступень 1: Режекторный фильтр (Notch) подавления 2-й гармоники нижележащей струны (+200 центов)
+            // Ступень 1: Режекторный фильтр (Notch)
             const float n0 = nt_b0 * h0 + nt_b1 * nt_x1 + nt_b2 * nt_x2 - nt_a1 * nt_y1 - nt_a2 * nt_y2;
             nt_x2 = nt_x1;
             nt_x1 = h0;
@@ -368,7 +434,7 @@ private:
             s2_y2 = s2_y1;
             s2_y1 = y2;
 
-            // Ступень 5: Полосовой резонатор 3 (высокая избирательность против межструнных биений)
+            // Ступень 5: Полосовой резонатор 3
             const float y3 = bp_b0 * y2 + bp_b2 * s3_x2 - bp_a1 * s3_y1 - bp_a2 * s3_y2;
             s3_x2 = s3_x1;
             s3_x1 = y2;
@@ -380,7 +446,7 @@ private:
             ++samplesSincePos;
             ++samplesSinceNeg;
 
-            // 1. Пересечение нуля снизу вверх (целочисленный счётчик исключает потерю точности float)
+            // 1. Пересечение нуля снизу вверх
             if (prevSample < 0.0f && y3 >= 0.0f)
             {
                 const float denom = y3 - prevSample;
@@ -474,13 +540,13 @@ private:
     int   inputSamplesCount   = 0;
     float smoothInputRms      = 0.0f;
 
-    // Анти-алиасинговый фильтр Баттерворта перед децимацией
+    // Анти-алиасинговый фильтр Баттерворта перед децимацией (срез 1800 Гц для захвата 2-й гармоники 1-й и 2-й струн)
     float aa_b0 = 0.0f, aa_b1 = 0.0f, aa_b2 = 0.0f, aa_a1 = 0.0f, aa_a2 = 0.0f;
     float aa_x1 = 0.0f, aa_x2 = 0.0f, aa_y1 = 0.0f, aa_y2 = 0.0f;
 
     void setupAntiAliasFilter (double sampleRate) noexcept
     {
-        constexpr float cutoff = 1600.0f;
+        constexpr float cutoff = 1800.0f;
         constexpr float twoPi  = std::numbers::pi_v<float> * 2.0f;
         const float omega      = twoPi * cutoff / static_cast<float> (sampleRate);
         const float sn         = std::sin (omega);
@@ -507,20 +573,30 @@ private:
 
     void evaluateChannels (bool monoHasStrongSingleLock) noexcept
     {
-        // 0. Детекция удара медиатором (при атаке приостанавливаем запись периодов на ~100 мс,
-        //    НО НЕ стираем накопленный буфер периодов, чтобы строй не прыгал и не сбрасывался!)
         const float frameInputRms = (inputSamplesCount > 0)
                                         ? std::sqrt (inputSqSum / static_cast<float> (inputSamplesCount))
                                         : 0.0f;
         inputSqSum        = 0.0f;
         inputSamplesCount = 0;
 
-        const bool isPickAttack = (frameInputRms > smoothInputRms * 1.55f) && (frameInputRms > 0.0012f);
+        const bool isPickAttack = (frameInputRms > smoothInputRms * 1.55f) && (frameInputRms > 0.0015f);
         smoothInputRms          = smoothInputRms * 0.72f + frameInputRms * 0.28f;
 
         if (isPickAttack)
         {
-            attackBlankFrames = 5; // ~100 мс блокировки записи переходного процесса щипка
+            attackBlankFrames = 5; // ~100 мс глобальной блокировки переходного процесса боя по струнам
+            for (int s = 0; s < numConfiguredStrings; ++s)
+            {
+                auto& ch           = channels[static_cast<std::size_t> (s)];
+                ch.framesSincePeak = 0;
+                ch.peakEnergy      = 0.0f;
+                if (ch.harmOrder > 1)
+                {
+                    ch.ringCount     = 0;
+                    ch.ringWriteIdx  = 0;
+                    ch.lockAgeFrames = 0;
+                }
+            }
         }
         else if (attackBlankFrames > 0)
         {
@@ -540,15 +616,43 @@ private:
                                  ? std::sqrt (ch.energySum / static_cast<float> (ch.energySamples))
                                  : 0.0f;
 
-            // Сохраняем неискажённую (без подъёма ВЧ) энергию для точного распознавания обертонов 6-й и 5-й струн
+            // Поканальная детекция щипка конкретной струны (учитывает задержку 40..80 мс при бое медиатором от 6-й к 1-й струне)
+            const bool chAttack = (r > ch.rawRmsSmooth * 1.45f) && (r > 0.00022f);
+
             if (r > ch.rawRmsSmooth)
                 ch.rawRmsSmooth = ch.rawRmsSmooth * 0.30f + r * 0.70f;
             else
                 ch.rawRmsSmooth = ch.rawRmsSmooth * 0.86f + r * 0.14f;
             rawRms[idx] = ch.rawRmsSmooth;
 
+            if (chAttack)
+            {
+                ch.channelBlankFrames = 3; // ~60 мс пропуска щелчка медиатора по данной струне
+                ch.peakEnergy         = ch.rawRmsSmooth;
+                ch.framesSincePeak    = 0;
+                if (ch.harmOrder > 1)
+                {
+                    ch.ringCount     = 0;
+                    ch.ringWriteIdx  = 0;
+                    ch.lockAgeFrames = 0;
+                }
+            }
+            else
+            {
+                if (ch.channelBlankFrames > 0)
+                {
+                    --ch.channelBlankFrames;
+                }
+                else
+                {
+                    if (ch.rawRmsSmooth > ch.peakEnergy)
+                        ch.peakEnergy = ch.rawRmsSmooth;
+                    ++ch.framesSincePeak;
+                }
+            }
+
             // Выравнивание чувствительности тонких струн для отображения
-            const float highStringGain = 1.0f + (static_cast<float> (s) / denomStrings) * 0.85f;
+            const float highStringGain = 1.0f + (static_cast<float> (s) / denomStrings) * 0.90f;
             const float boosted        = r * highStringGain;
 
             if (boosted > ch.smoothedEnergy)
@@ -563,14 +667,11 @@ private:
             ch.energySamples = 0;
         }
 
-        const float absFloor          = 0.000045f + (1.0f - sensitivity) * 0.000030f;
+        const float absFloor          = 0.000040f + (1.0f - sensitivity) * 0.000030f;
         const float displayGateThresh = std::max (absFloor, maxChannelRms * 0.045f);
         const float curve             = sensitivity * sensitivity;
 
-        // 1. Определяем, какие верхние каналы возбуждены обертонами (2*f0, 3*f0, 4*f0) звучащей нижней струны.
-        //    КРИТИЧНО: сравниваем неискажённую энергию rawRms[low] с rawRms[s]*0.08f, а НЕ с maxChannelRms!
-        //    У электрогитары при щипке 6-й струны (D#2 = 77.8 Гц) её 3-я гармоника (233.3 Гц = 2-я струна A#3)
-        //    и 4-я гармоника (311.1 Гц = 1-я струна D#4) имеют амплитуду в 2..2.5 раза ВЫШЕ основного тона 6-й струны!
+        // 1. Определяем гармонически связанные струны (по их базовым частотам baseFreqHz) для надёжного разделения Solo / Polytune
         std::array<bool, kMaxStrings> isHarmonicOfLower {};
         float maxNonHarmonicRms    = 0.0f;
         float secondNonHarmonicRms = 0.0f;
@@ -584,11 +685,10 @@ private:
             for (int low = 0; low < s; ++low)
             {
                 const auto lowIdx = static_cast<std::size_t> (low);
-                // Если нижняя струна реально звучит (выше порога тишины и >= 8% от энергии верхней гармоники)
                 if (rawRms[lowIdx] < absFloor * 3.0f || rawRms[lowIdx] < rawRms[idx] * 0.08f)
                     continue;
 
-                const float ratio = ch.targetFreqHz / channels[lowIdx].targetFreqHz;
+                const float ratio = ch.baseFreqHz / channels[lowIdx].baseFreqHz;
                 const float near2 = std::abs (ratio - 2.0f);
                 const float near3 = std::abs (ratio - 3.0f);
                 const float near4 = std::abs (ratio - 4.0f);
@@ -628,11 +728,7 @@ private:
                 ++nonHarmonicActiveCount;
         }
 
-        // 3. Стабильная логика переключения Solo <-> Polytune (как в TC Electronic PolyTune):
-        //    - Для входа в Polytune при чесе по струнам требуется минимум 3 независимых негармонических струны
-        //      (или 2 для 4-струнного баса), преодоление порога уровня (0.0012) и 5 кадров (~100 мс) подтверждения.
-        //    - Внутри Polytune режим надёжно удерживается (polyHoldFrames = 65, ~1.3 с) и продлевается,
-        //      пока звучат хотя бы 2 струны, не перескакивая туда-обратно.
+        // 3. Стабильная логика переключения Solo <-> Polytune
         const int minChordStrings = (numConfiguredStrings <= 4) ? 2 : 3;
         const bool singleStringDominant = (maxNonHarmonicRms > absFloor * 3.0f) &&
                                           (secondNonHarmonicRms < maxNonHarmonicRms * 0.18f) &&
@@ -660,15 +756,13 @@ private:
         }
         else
         {
-            // Уже в режиме Polytune: поддерживаем удержание, пока звучат >= 2 независимые струны
             if (nonHarmonicActiveCount >= 2 && maxNonHarmonicRms >= absFloor * 2.5f)
             {
-                polyHoldFrames     = std::max (polyHoldFrames, 55); // продлеваем ещё на ~1.1 с
+                polyHoldFrames     = std::max (polyHoldFrames, 55);
                 soloOverrideFrames = 0;
             }
             else if (singleStringDominant && monoHasStrongSingleLock && attackBlankFrames == 0)
             {
-                // Если музыкант приглушил аккорд и отчётливо дёрнул одну струну, выходим в Solo через ~120 мс
                 if (++soloOverrideFrames >= 6)
                 {
                     polyModeLocked     = false;
@@ -694,8 +788,25 @@ private:
             const auto idx = static_cast<std::size_t> (s);
             auto& ch       = channels[idx];
 
+            // Динамический режекторный фильтр (Notch) для 2-й струны (2*f2 = 466..494 Гц):
+            // Если 6-я струна (colliding3xIdx) расстроена более чем на 2.5 цента, её 6-я гармоника (6*f6)
+            // смещается и точно вырезается узким Notch-фильтром (Q = 18.0), чтобы 6-я струна никогда не тянула 2-ю!
+            if (ch.harmOrder == 2 && ch.colliding3xIdx >= 0)
+            {
+                const auto& lowCh = channels[static_cast<std::size_t> (ch.colliding3xIdx)];
+                if (lowCh.hasCentsInit && std::abs (lowCh.smoothedCents) > 2.5f)
+                {
+                    const float lowActualHz = lowCh.targetFreqHz * std::pow (2.0f, lowCh.smoothedCents / 1200.0f);
+                    ch.setNotchFilter (lowActualHz * 6.0f, 18.0f);
+                }
+                else
+                {
+                    ch.setNotchFilter (ch.defaultNotchHz, 6.0f);
+                }
+            }
+
             const float activeThresh = polyModeLocked
-                                           ? std::max (absFloor, maxChannelRms * 0.030f)
+                                           ? std::max (absFloor, maxChannelRms * 0.025f)
                                            : displayGateThresh;
             const bool hasRecentCycles = (ch.newPeriodsInWindow >= 1) ||
                                          (ch.ringCount >= 4 && chRms[idx] >= activeThresh * 1.2f);
@@ -706,9 +817,17 @@ private:
                 float iqrSpreadCents = 0.0f;
                 const float stablePeriod = ch.computeStablePeriod (iqrSpreadCents);
 
-                // Обновляем оценку высоты тона только когда периоды когерентны (IQR < 8 центов)
-                // и не идёт стартовый щелчок медиатора
-                if (attackBlankFrames == 0 && iqrSpreadCents < 8.0f)
+                // Для тонких струн без обмотки (harmOrder > 1, 1-я и 2-я струны), которые затухают быстрее толстых басовых струн,
+                // обновляем оценку высоты тона только в первые ~560 мс (28 кадров) после пика удара по струне,
+                // пока энергия струны составляет >= 34% от её пика. На хвосте сустейна значение фиксируется,
+                // чтобы обертоны долго звучащей 6-й струны (при вращении её колка) не влияли на 1-ю и 2-ю струны!
+                const bool isBlanked   = (attackBlankFrames > 0) || (ch.channelBlankFrames > 0);
+                const bool allowUpdate = (ch.harmOrder > 1)
+                                             ? (!isBlanked && ch.framesSincePeak <= 28 && ch.rawRmsSmooth >= ch.peakEnergy * 0.34f)
+                                             : (!isBlanked && ch.rawRmsSmooth >= ch.peakEnergy * 0.08f);
+                const float maxIqr     = (ch.harmOrder > 1) ? 5.5f : 8.0f;
+
+                if (allowUpdate && iqrSpreadCents < maxIqr)
                 {
                     const float measuredHz = decimatedFs / stablePeriod;
                     const float rawCents   = 1200.0f * std::log2 (measuredHz / ch.targetFreqHz) + ch.inharmCents;
@@ -723,11 +842,11 @@ private:
                     else
                     {
                         ++ch.lockAgeFrames;
-                        // Плавная фильтрация: чем чище когерентность периодов, тем выше доверие
-                        const float coherenceWeight = (iqrSpreadCents < 3.5f) ? 1.0f : 0.45f;
+                        const float coherenceWeight = (iqrSpreadCents < 3.5f) ? 1.0f : 0.55f;
                         if (ch.lockAgeFrames <= 6)
                         {
-                            ch.smoothedCents += (clampedC - ch.smoothedCents) * (0.35f * coherenceWeight);
+                            const float fastAlpha = (ch.harmOrder > 1) ? 0.55f : 0.35f;
+                            ch.smoothedCents += (clampedC - ch.smoothedCents) * (fastAlpha * coherenceWeight);
                         }
                         else
                         {
@@ -744,7 +863,7 @@ private:
                 if (ch.hasCentsInit)
                 {
                     ch.isLocked   = true;
-                    ch.holdFrames = 45; // ~900 мс плавного удержания зажжённого столбца струны
+                    ch.holdFrames = 55; // ~1.1 с плавного удержания зажжённого столбца струны
                 }
             }
             else if (ch.holdFrames > 0 && polyModeLocked)

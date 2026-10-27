@@ -4,18 +4,25 @@ export interface PolyStringResult {
   active: boolean;
 }
 
-function inharmOffsetCents(freqHz: number): number {
-  if (freqHz < 90.0) return 3.45;
-  if (freqHz < 120.0) return 2.8;
-  if (freqHz < 160.0) return 2.95;
-  if (freqHz < 210.0) return 1.65;
+function inharmOffsetCents(baseFreqHz: number, harmOrder: number): number {
+  if (harmOrder > 1) return 0.0;
+  if (baseFreqHz < 90.0) return 3.45;
+  if (baseFreqHz < 120.0) return 2.8;
+  if (baseFreqHz < 160.0) return 2.95;
+  if (baseFreqHz < 210.0) return 1.65;
   return 1.0;
 }
 
 class ResonatorChannel {
   static readonly kRingSize = 32;
 
+  baseFreqHz = 100.0;
   targetFreqHz = 100.0;
+  sampleRateDec = 24000.0;
+  defaultNotchHz = 200.0;
+  harmOrder = 1;
+  colliding3xIdx = -1;
+
   expectedPeriod = 240.0;
   minValidPeriod = 230.0;
   maxValidPeriod = 250.0;
@@ -79,6 +86,10 @@ class ResonatorChannel {
   energySamples = 0;
 
   rawRmsSmooth = 0.0;
+  peakEnergy = 0.0;
+  framesSincePeak = 100;
+  channelBlankFrames = 0;
+
   smoothedCents = 0.0;
   smoothedEnergy = 0.0;
   holdFrames = 0;
@@ -107,6 +118,9 @@ class ResonatorChannel {
     this.energySum = 0.0;
     this.energySamples = 0;
     this.rawRmsSmooth = 0.0;
+    this.peakEnergy = 0.0;
+    this.framesSincePeak = 100;
+    this.channelBlankFrames = 0;
     this.smoothedCents = 0.0;
     this.smoothedEnergy = 0.0;
     this.holdFrames = 0;
@@ -115,26 +129,13 @@ class ResonatorChannel {
     this.hasCentsInit = false;
   }
 
-  configure(freqHz: number, notchHz: number, sampleRateDec: number): void {
-    this.targetFreqHz = Math.max(20.0, Math.min(sampleRateDec * 0.42, freqHz));
-    this.expectedPeriod = sampleRateDec / this.targetFreqHz;
-    this.inharmCents = inharmOffsetCents(this.targetFreqHz);
-    this.minValidPeriod = this.expectedPeriod * 0.9685;
-    this.maxValidPeriod = this.expectedPeriod * 1.0325;
-
+  setNotchFilter(notchHz: number, qVal: number): void {
     const twoPi = 2.0 * Math.PI;
-
-    const hpCutoff = Math.max(18.0, Math.min(sampleRateDec * 0.35, this.targetFreqHz * 0.78));
-    this.hp_coeff = Math.exp((-twoPi * hpCutoff) / sampleRateDec);
-
-    const clampedNotch = Math.max(
-      this.targetFreqHz * 1.08,
-      Math.min(sampleRateDec * 0.44, notchHz)
-    );
-    const ntOmega = (twoPi * clampedNotch) / sampleRateDec;
+    const clampedNotch = Math.max(20.0, Math.min(this.sampleRateDec * 0.44, notchHz));
+    const ntOmega = (twoPi * clampedNotch) / this.sampleRateDec;
     const ntSn = Math.sin(ntOmega);
     const ntCs = Math.cos(ntOmega);
-    const ntAlpha = ntSn / (2.0 * 8.0);
+    const ntAlpha = ntSn / (2.0 * qVal);
     const ntInvA0 = 1.0 / (1.0 + ntAlpha);
 
     this.nt_b0 = ntInvA0;
@@ -142,8 +143,39 @@ class ResonatorChannel {
     this.nt_b2 = ntInvA0;
     this.nt_a1 = this.nt_b1;
     this.nt_a2 = (1.0 - ntAlpha) * ntInvA0;
+  }
 
-    const lpCutoff = Math.max(35.0, Math.min(sampleRateDec * 0.45, this.targetFreqHz * 1.26));
+  configure(
+    baseHz: number,
+    notchHz: number,
+    harmonicMultiplier: number,
+    colliding3xStringIdx: number,
+    resonatorQ: number,
+    sampleRateDec: number
+  ): void {
+    this.sampleRateDec = sampleRateDec;
+    this.baseFreqHz = Math.max(20.0, Math.min(sampleRateDec * 0.42, baseHz));
+    this.harmOrder = Math.max(1, harmonicMultiplier);
+    this.colliding3xIdx = colliding3xStringIdx;
+    this.targetFreqHz = Math.max(
+      20.0,
+      Math.min(sampleRateDec * 0.42, this.baseFreqHz * this.harmOrder)
+    );
+    this.defaultNotchHz = notchHz;
+
+    this.expectedPeriod = sampleRateDec / this.targetFreqHz;
+    this.inharmCents = inharmOffsetCents(this.baseFreqHz, this.harmOrder);
+    this.minValidPeriod = this.expectedPeriod * 0.9685;
+    this.maxValidPeriod = this.expectedPeriod * 1.0325;
+
+    const twoPi = 2.0 * Math.PI;
+
+    const hpCutoff = Math.max(18.0, Math.min(sampleRateDec * 0.38, this.targetFreqHz * 0.8));
+    this.hp_coeff = Math.exp((-twoPi * hpCutoff) / sampleRateDec);
+
+    this.setNotchFilter(this.defaultNotchHz, this.harmOrder > 1 ? 6.0 : 8.0);
+
+    const lpCutoff = Math.max(35.0, Math.min(sampleRateDec * 0.45, this.targetFreqHz * 1.22));
     const lpOmega = (twoPi * lpCutoff) / sampleRateDec;
     const lpSn = Math.sin(lpOmega);
     const lpCs = Math.cos(lpOmega);
@@ -156,9 +188,8 @@ class ResonatorChannel {
     this.lp_a1 = -2.0 * lpCs * lpInvA0;
     this.lp_a2 = (1.0 - lpAlpha) * lpInvA0;
 
-    const Q = 18.0;
     const bpOmega = (twoPi * this.targetFreqHz) / sampleRateDec;
-    const poleR = Math.exp(-bpOmega / (2.0 * Q));
+    const poleR = Math.exp(-bpOmega / (2.0 * resonatorQ));
     const poleR2 = poleR * poleR;
 
     this.bp_a1 = -2.0 * poleR * Math.cos(bpOmega);
@@ -178,7 +209,9 @@ class ResonatorChannel {
     }
   }
 
-  processSample(x: number, recordPeriods: boolean): void {
+  processSample(x: number, globalBlank: boolean): void {
+    const recordPeriods = !globalBlank && this.channelBlankFrames === 0;
+
     const h0 = x - this.hp_x1 + this.hp_coeff * this.hp_y1;
     this.hp_x1 = x;
     this.hp_y1 = h0;
@@ -388,18 +421,52 @@ export class PolyPitchDetector {
     this.currentA4Ref = a4Ref;
 
     const clampedCount = Math.max(0, Math.min(PolyPitchDetector.kMaxStrings, count));
+    const baseFreqs = new Array<number>(clampedCount).fill(100.0);
     for (let i = 0; i < clampedCount; ++i) {
       const exactMidi = activeMidi[i] + activeOffsets[i] * 0.01;
-      const freqHz = a4Ref * Math.pow(2.0, (exactMidi - 69.0) / 12.0);
-      let notchFreqHz = freqHz * 2.0;
-      if (i >= 2) {
-        const low2Midi = activeMidi[i - 2] + activeOffsets[i - 2] * 0.01;
-        const low2Harm2 = 2.0 * a4Ref * Math.pow(2.0, (low2Midi - 69.0) / 12.0);
-        if (low2Harm2 > freqHz * 1.07 && low2Harm2 < freqHz * 1.25) {
-          notchFreqHz = low2Harm2;
+      baseFreqs[i] = a4Ref * Math.pow(2.0, (exactMidi - 69.0) / 12.0);
+    }
+
+    for (let i = 0; i < clampedCount; ++i) {
+      const baseHz = baseFreqs[i];
+      let harmOrder = 1;
+      let colliding3xIdx = -1;
+      let resonatorQ = 18.0;
+
+      for (let low = 0; low < i; ++low) {
+        const ratio = baseHz / baseFreqs[low];
+        if (Math.abs(ratio - 3.0) < 0.035) {
+          harmOrder = 2;
+          colliding3xIdx = low;
+          resonatorQ = 15.0;
+          break;
+        }
+        if (Math.abs(ratio - 4.0) < 0.035) {
+          harmOrder = 2;
+          resonatorQ = 20.0;
+          break;
         }
       }
-      this.channels[i].configure(freqHz, notchFreqHz, this.decimatedFs);
+
+      const effectiveHz = baseHz * harmOrder;
+      let notchFreqHz = effectiveHz * 2.0;
+      if (harmOrder === 1 && i >= 2) {
+        const low2Harm2 = 2.0 * baseFreqs[i - 2];
+        if (low2Harm2 > effectiveHz * 1.07 && low2Harm2 < effectiveHz * 1.25) {
+          notchFreqHz = low2Harm2;
+        }
+      } else if (harmOrder === 2 && i >= 1) {
+        notchFreqHz = 3.0 * baseFreqs[i - 1];
+      }
+
+      this.channels[i].configure(
+        baseHz,
+        notchFreqHz,
+        harmOrder,
+        colliding3xIdx,
+        resonatorQ,
+        this.decimatedFs
+      );
     }
     this.numActiveStrings = clampedCount;
   }
@@ -418,9 +485,9 @@ export class PolyPitchDetector {
         this.inputSqSum += aaOut * aaOut;
         ++this.inputSamplesCount;
 
-        const recordPeriods = this.attackBlankFrames === 0;
+        const globalBlank = this.attackBlankFrames > 0;
         for (let s = 0; s < this.numActiveStrings; ++s) {
-          this.channels[s].processSample(aaOut, recordPeriods);
+          this.channels[s].processSample(aaOut, globalBlank);
         }
         if (++this.samplesInWindow >= this.windowSizeSamples) {
           this.samplesInWindow = 0;
@@ -439,7 +506,7 @@ export class PolyPitchDetector {
   }
 
   private setupAntiAliasingFilter(): void {
-    const cutoff = 1600.0;
+    const cutoff = 1800.0;
     const omega = (2.0 * Math.PI * cutoff) / this.fs;
     const sn = Math.sin(omega);
     const cs = Math.cos(omega);
@@ -474,11 +541,21 @@ export class PolyPitchDetector {
     this.inputSqSum = 0.0;
     this.inputSamplesCount = 0;
 
-    const isPickAttack = frameInputRms > this.smoothInputRms * 1.55 && frameInputRms > 0.0012;
+    const isPickAttack = frameInputRms > this.smoothInputRms * 1.55 && frameInputRms > 0.0015;
     this.smoothInputRms = this.smoothInputRms * 0.72 + frameInputRms * 0.28;
 
     if (isPickAttack) {
       this.attackBlankFrames = 5;
+      for (let s = 0; s < this.numActiveStrings; ++s) {
+        const ch = this.channels[s];
+        ch.framesSincePeak = 0;
+        ch.peakEnergy = 0.0;
+        if (ch.harmOrder > 1) {
+          ch.ringCount = 0;
+          ch.ringWriteIdx = 0;
+          ch.lockAgeFrames = 0;
+        }
+      }
     } else if (this.attackBlankFrames > 0) {
       --this.attackBlankFrames;
     }
@@ -491,6 +568,7 @@ export class PolyPitchDetector {
     for (let s = 0; s < this.numActiveStrings; ++s) {
       const ch = this.channels[s];
       const r = ch.energySamples > 0 ? Math.sqrt(ch.energySum / ch.energySamples) : 0.0;
+      const chAttack = r > ch.rawRmsSmooth * 1.45 && r > 0.00022;
 
       if (r > ch.rawRmsSmooth) {
         ch.rawRmsSmooth = ch.rawRmsSmooth * 0.3 + r * 0.7;
@@ -499,7 +577,25 @@ export class PolyPitchDetector {
       }
       rawRms[s] = ch.rawRmsSmooth;
 
-      const highStringGain = 1.0 + (s / denomStrings) * 0.85;
+      if (chAttack) {
+        ch.channelBlankFrames = 3;
+        ch.peakEnergy = ch.rawRmsSmooth;
+        ch.framesSincePeak = 0;
+        if (ch.harmOrder > 1) {
+          ch.ringCount = 0;
+          ch.ringWriteIdx = 0;
+          ch.lockAgeFrames = 0;
+        }
+      } else {
+        if (ch.channelBlankFrames > 0) {
+          --ch.channelBlankFrames;
+        } else {
+          if (ch.rawRmsSmooth > ch.peakEnergy) ch.peakEnergy = ch.rawRmsSmooth;
+          ++ch.framesSincePeak;
+        }
+      }
+
+      const highStringGain = 1.0 + (s / denomStrings) * 0.9;
       const boosted = r * highStringGain;
 
       if (boosted > ch.smoothedEnergy) {
@@ -515,7 +611,7 @@ export class PolyPitchDetector {
       ch.energySamples = 0;
     }
 
-    const absFloor = 0.000045 + (1.0 - this.sensitivity) * 0.00003;
+    const absFloor = 0.00004 + (1.0 - this.sensitivity) * 0.00003;
     const displayGateThresh = Math.max(absFloor, maxChannelRms * 0.045);
     const curve = this.sensitivity * this.sensitivity;
 
@@ -528,7 +624,7 @@ export class PolyPitchDetector {
       let harmonicFlag = false;
       for (let low = 0; low < s; ++low) {
         if (rawRms[low] < absFloor * 3.0 || rawRms[low] < rawRms[s] * 0.08) continue;
-        const ratio = ch.targetFreqHz / this.channels[low].targetFreqHz;
+        const ratio = ch.baseFreqHz / this.channels[low].baseFreqHz;
         if (
           Math.abs(ratio - 2.0) < 0.035 ||
           Math.abs(ratio - 3.0) < 0.035 ||
@@ -610,8 +706,19 @@ export class PolyPitchDetector {
       }
 
       const ch = this.channels[s];
+
+      if (ch.harmOrder === 2 && ch.colliding3xIdx >= 0) {
+        const lowCh = this.channels[ch.colliding3xIdx];
+        if (lowCh.hasCentsInit && Math.abs(lowCh.smoothedCents) > 2.5) {
+          const lowActualHz = lowCh.targetFreqHz * Math.pow(2.0, lowCh.smoothedCents / 1200.0);
+          ch.setNotchFilter(lowActualHz * 6.0, 18.0);
+        } else {
+          ch.setNotchFilter(ch.defaultNotchHz, 6.0);
+        }
+      }
+
       const activeThresh = this.polyModeConfirmed
-        ? Math.max(absFloor, maxChannelRms * 0.03)
+        ? Math.max(absFloor, maxChannelRms * 0.025)
         : displayGateThresh;
       const hasRecentCycles =
         ch.newPeriodsInWindow >= 1 || (ch.ringCount >= 4 && chRms[s] >= activeThresh * 1.2);
@@ -619,7 +726,14 @@ export class PolyPitchDetector {
 
       if (!suppressHarmonicGhost && chRms[s] >= activeThresh && hasRecentCycles && ch.ringCount >= 4) {
         const { period, iqrSpreadCents } = ch.computeStablePeriod();
-        if (this.attackBlankFrames === 0 && iqrSpreadCents < 8.0) {
+        const isBlanked = this.attackBlankFrames > 0 || ch.channelBlankFrames > 0;
+        const allowUpdate =
+          ch.harmOrder > 1
+            ? !isBlanked && ch.framesSincePeak <= 28 && ch.rawRmsSmooth >= ch.peakEnergy * 0.34
+            : !isBlanked && ch.rawRmsSmooth >= ch.peakEnergy * 0.08;
+        const maxIqr = ch.harmOrder > 1 ? 5.5 : 8.0;
+
+        if (allowUpdate && iqrSpreadCents < maxIqr) {
           const measuredHz = this.decimatedFs / Math.max(1.0, period);
           const rawCents = 1200.0 * Math.log2(measuredHz / ch.targetFreqHz) + ch.inharmCents;
           const clampedCents = Math.max(-50.0, Math.min(50.0, rawCents));
@@ -630,9 +744,10 @@ export class PolyPitchDetector {
             ch.lockAgeFrames = 1;
           } else {
             ++ch.lockAgeFrames;
-            const coherenceWeight = iqrSpreadCents < 3.5 ? 1.0 : 0.45;
+            const coherenceWeight = iqrSpreadCents < 3.5 ? 1.0 : 0.55;
             if (ch.lockAgeFrames <= 6) {
-              ch.smoothedCents += (clampedCents - ch.smoothedCents) * (0.35 * coherenceWeight);
+              const fastAlpha = ch.harmOrder > 1 ? 0.55 : 0.35;
+              ch.smoothedCents += (clampedCents - ch.smoothedCents) * (fastAlpha * coherenceWeight);
             } else {
               const centsDiff = Math.abs(clampedCents - ch.smoothedCents);
               const minW = centsDiff < 1.5 ? 0.025 : centsDiff < 4.0 ? 0.05 : 0.1;
@@ -645,7 +760,7 @@ export class PolyPitchDetector {
 
         if (ch.hasCentsInit) {
           ch.isLocked = true;
-          ch.holdFrames = 45;
+          ch.holdFrames = 55;
         }
       } else if (ch.holdFrames > 0 && this.polyModeConfirmed) {
         --ch.holdFrames;
