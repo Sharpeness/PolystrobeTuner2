@@ -378,13 +378,20 @@ private:
 
         const float rawFreq = static_cast<float> (fs) / exactFullPeriod;
 
-        const float minAllowedFreq = isBassMode ? 20.0f : 36.0f;
+        const float minAllowedFreq = isBassMode ? 20.0f : 42.0f;
         const float maxAllowedFreq = isBassMode ? 800.0f : 2000.0f;
         if (rawFreq < minAllowedFreq || rawFreq > maxAllowedFreq)
             return;
 
+        // Защита от ложного захвата субгармоники аккорда (~46.3 Гц G1/F#1 от биений струн 4, 3, 2 в отношении 3:4:5):
+        // В гитарном режиме частоты ниже 65 Гц принимаются только при высокой чистоте периодичности одиночной струны
+        if (!isBassMode && rawFreq < 65.0f && highestVal < 0.78f)
+            return;
+
         // 3. Нелинейное сглаживание от ручки Accuracy и защита от скачков (Note Lock)
-        if (lockedFrequency <= 0.0f || (isAttack && sensitivity > 0.70f))
+        // При атаке медиатором мгновенный перезахват разрешён только при высокой чистоте тона (highestVal >= 0.82),
+        // чтобы стартовый скрежет медиатора не вызывал кратковременный выброс (+40..+50 центов)
+        if (lockedFrequency <= 0.0f || (isAttack && sensitivity > 0.70f && highestVal >= 0.82f))
         {
             lockedFrequency    = rawFreq;
             detectedFrequency  = rawFreq;
