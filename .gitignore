@@ -1,0 +1,10 @@
+/build/
+/cmake-build-*/
+.idea/
+.vs/
+*.user
+/node_modules/
+/dist/
+/public/assets/aistudio/
+*.mp4
+*.log

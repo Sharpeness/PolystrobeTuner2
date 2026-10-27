@@ -1,0 +1,6 @@
+{
+  "summary":  "План рефакторинга StrobTuner под стандарт C++23 (MSVC / JUCE 8) и подготовки архитектуры DSP/UI к полифоническому режиму (Polytune), начиная с базового слоя DSP.",
+  "updatedAt":  "2026-10-26T21:40:47.067250366Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

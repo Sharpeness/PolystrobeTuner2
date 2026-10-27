@@ -1,0 +1,7 @@
+{
+  "name": "StrobeTuner",
+  "description": "High-precision guitar and bass strobe tuner with MPM pitch detection, Peterson/EVH/Buzz Feiten sweeteners, and hardware pedal UI.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
