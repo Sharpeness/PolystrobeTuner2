@@ -106,32 +106,30 @@ public:
 
         for (int i = 0; i < numConfiguredStrings; ++i)
         {
-            const auto idx      = static_cast<std::size_t> (i);
-            const float baseHz  = baseFreqs[idx];
+            const auto idx     = static_cast<std::size_t> (i);
+            const float baseHz = baseFreqs[idx];
 
-            // Проверяем, не совпадает ли основной тон струны s (1*f_s) с мощной 3-й или 4-й гармоникой
-            // нижележащей толстой струны (например, 2-я струна B3/A#3 совпадает с 3-й гармоникой 6-й струны E2/D#2,
-            // а 1-я струна E4/D#4 совпадает с 4-й гармоникой 6-й струны и 3-й гармоникой 5-й струны).
-            // Для таких верхних струн отслеживаем их 2-ю гармонику (2*f_s), которая свободна от 3*f6 и 4*f6!
-            int harmOrder       = 1;
-            int colliding3xIdx  = -1;
-            float resonatorQ    = 18.0f;
+            // Если основной тон струны s (1*f_s) совпадает с мощной 3-й или 4-й гармоникой нижележащей басовой струны
+            // (2-я струна совпадает с 3*f6, 1-я струна совпадает с 4*f6 и 3*f5), отслеживаем их 2-ю гармонику (2*f_s).
+            int harmOrder      = 1;
+            int colliding3xIdx = -1;
+            int colliding4xIdx = -1;
+            float resonatorQ   = 18.0f;
 
             for (int low = 0; low < i; ++low)
             {
                 const float ratio = baseHz / baseFreqs[static_cast<std::size_t> (low)];
-                if (std::abs (ratio - 3.0f) < 0.035f)
+                if (std::abs (ratio - 3.0f) < 0.035f && harmOrder == 1)
                 {
                     harmOrder      = 2;
-                    colliding3xIdx = low; // 2-я струна: на частоте 2*f2 может мешать только 6*f6 при расстроенной 6-й струне
-                    resonatorQ     = 15.0f;
-                    break;
+                    colliding3xIdx = low; // 2-я струна: на частоте 2*f2 соседствует только 6*f6
+                    resonatorQ     = 14.5f;
                 }
-                if (std::abs (ratio - 4.0f) < 0.035f)
+                else if (std::abs (ratio - 4.0f) < 0.035f && harmOrder == 1)
                 {
-                    harmOrder  = 2; // 1-я струна: отслеживаем 2*f1 (622..659 Гц), свободную от 4*f6 и 3*f5
-                    resonatorQ = 20.0f;
-                    break;
+                    harmOrder      = 2;
+                    colliding4xIdx = low; // 1-я струна: отслеживаем 2*f1 (622..659 Гц)
+                    resonatorQ     = 18.5f;
                 }
             }
 
@@ -152,7 +150,7 @@ public:
                 notchFreqHz = 3.0f * baseFreqs[static_cast<std::size_t> (i - 1)];
             }
 
-            channels[idx].configure (baseHz, notchFreqHz, harmOrder, colliding3xIdx, resonatorQ, decimatedFs);
+            channels[idx].configure (baseHz, notchFreqHz, harmOrder, colliding3xIdx, colliding4xIdx, resonatorQ, decimatedFs);
         }
     }
 
@@ -197,15 +195,17 @@ public:
 
 private:
     // Физическая компенсация негармоничности жёсткости гитарных струн (f_n = n * f_1 * sqrt(1 + B * n^2)):
-    // У витых струн (harmOrder == 1) основное колебание f_1 лежит на 1.6..3.4 цента ниже гармонического центра тяжести,
-    // а для тонких струн без обмотки (harmOrder == 2) замер уже ведётся direttamente на 2-й гармонике (2*f0).
+    // 1. У витых струн (harmOrder == 1) основное колебание f_1 лежит на 1.6..3.4 цента ниже гармонического центра тяжести.
+    // 2. У тонких необмоточных струн 1 и 2 при замере на 2-й гармонике (harmOrder == 2) частота f_2 физически
+    //    растянута жёсткостью сердечника выше 2*f_1 примерно на +1.35 цента, поэтому компенсируем на -1.35 цента,
+    //    чтобы установившееся значение после отката точно совпадало с основным тоном струны в Solo-режиме.
     [[nodiscard]] static constexpr float inharmOffsetCents (float baseFreqHz, int harmOrder) noexcept
     {
-        if (harmOrder > 1)       return 0.0f;  // 1-я и 2-я струны замеряются на 2-й гармонике
-        if (baseFreqHz < 90.0f)  return 3.45f; // 6-я струна (E2 / D#2 / D2) и басовые струны
-        if (baseFreqHz < 120.0f) return 2.80f; // 5-я струна (A2 / G#2)
-        if (baseFreqHz < 160.0f) return 2.95f; // 4-я струна (D3 / C#3)
-        if (baseFreqHz < 210.0f) return 1.65f; // 3-я струна (G3 / F#3)
+        if (harmOrder > 1)       return -1.35f; // Компенсация растяжения 2-й гармоники тонких струн 1 и 2
+        if (baseFreqHz < 90.0f)  return 3.45f;  // 6-я струна (E2 / D#2 / D2) и басовые струны
+        if (baseFreqHz < 120.0f) return 2.80f;  // 5-я струна (A2 / G#2)
+        if (baseFreqHz < 160.0f) return 2.95f;  // 4-я струна (D3 / C#3)
+        if (baseFreqHz < 210.0f) return 1.65f;  // 3-я струна (G3 / F#3)
         return 1.00f;
     }
 
@@ -219,6 +219,7 @@ private:
         float defaultNotchHz = 200.0f;
         int   harmOrder      = 1;
         int   colliding3xIdx = -1;
+        int   colliding4xIdx = -1;
 
         float expectedPeriod = 240.0f;
         float minValidPeriod = 230.0f;
@@ -310,6 +311,25 @@ private:
             newPeriodsInWindow = 0;
         }
 
+        // Оставляет только последние keepCount периодов при новом ударе по струне, чтобы не терять захват,
+        // но быстро сбросить устаревшие периоды от пика атаки
+        void trimOldPeriods (std::size_t keepCount) noexcept
+        {
+            if (ringCount <= keepCount)
+                return;
+            std::array<float, kRingSize> temp {};
+            for (std::size_t i = 0; i < keepCount; ++i)
+            {
+                const std::size_t srcIdx = (ringWriteIdx + kRingSize - keepCount + i) & (kRingSize - 1);
+                temp[i] = periodRing[srcIdx];
+            }
+            periodRing.fill (0.0f);
+            for (std::size_t i = 0; i < keepCount; ++i)
+                periodRing[i] = temp[i];
+            ringWriteIdx = keepCount & (kRingSize - 1);
+            ringCount    = keepCount;
+        }
+
         void setNotchFilter (float notchHz, float qVal) noexcept
         {
             constexpr float twoPi    = std::numbers::pi_v<float> * 2.0f;
@@ -332,6 +352,7 @@ private:
             float notchHz,
             int   harmonicMultiplier,
             int   colliding3xStringIdx,
+            int   colliding4xStringIdx,
             float resonatorQ,
             float fsDec) noexcept
         {
@@ -339,6 +360,7 @@ private:
             baseFreqHz     = std::clamp (baseHz, 20.0f, sampleRateDec * 0.42f);
             harmOrder      = std::max (1, harmonicMultiplier);
             colliding3xIdx = colliding3xStringIdx;
+            colliding4xIdx = colliding4xStringIdx;
             targetFreqHz   = std::clamp (baseFreqHz * static_cast<float> (harmOrder), 20.0f, sampleRateDec * 0.42f);
             defaultNotchHz = notchHz;
 
@@ -478,23 +500,32 @@ private:
             prevSample = y3;
         }
 
-        // Межквартильное усечённое среднее по кольцевому буферу из 32 периодов + оценка когерентности (IQR в центах)
+        // Межквартильное усечённое среднее по кольцевому буферу периодов + оценка когерентности (IQR в центах)
         [[nodiscard]] float computeStablePeriod (float& outIqrSpreadCents) const noexcept
         {
             outIqrSpreadCents = 0.0f;
             if (ringCount == 0)
                 return expectedPeriod;
 
+            // На тонких струнах (harmOrder > 1) используем окно из последних 16 периодов (~25..35 мс на 466..660 Гц),
+            // чтобы анализатор мгновенно отслеживал откат высоты тона после атаки и подстройку колком на лету!
+            const std::size_t windowLen = (harmOrder > 1)
+                                              ? std::min<std::size_t> (ringCount, 16)
+                                              : ringCount;
+
             std::array<float, kRingSize> sorted {};
-            for (std::size_t i = 0; i < ringCount; ++i)
-                sorted[i] = periodRing[i];
-
-            std::sort (sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t> (ringCount));
-
-            if (ringCount >= 4)
+            for (std::size_t i = 0; i < windowLen; ++i)
             {
-                const std::size_t q1  = ringCount / 4;
-                const std::size_t q3  = ringCount - 1 - q1;
+                const std::size_t srcIdx = (ringWriteIdx + kRingSize - windowLen + i) & (kRingSize - 1);
+                sorted[i] = periodRing[srcIdx];
+            }
+
+            std::sort (sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t> (windowLen));
+
+            if (windowLen >= 4)
+            {
+                const std::size_t q1  = windowLen / 4;
+                const std::size_t q3  = windowLen - 1 - q1;
                 const float pLow      = sorted[q1];
                 const float pHigh     = sorted[q3];
                 outIqrSpreadCents     = (pLow > 1.0f) ? (1200.0f * std::log2 (pHigh / pLow)) : 99.0f;
@@ -506,10 +537,10 @@ private:
                     sum += sorted[i];
                     ++cnt;
                 }
-                return (cnt > 0) ? (sum / static_cast<float> (cnt)) : sorted[ringCount / 2];
+                return (cnt > 0) ? (sum / static_cast<float> (cnt)) : sorted[windowLen / 2];
             }
 
-            return sorted[ringCount / 2];
+            return sorted[windowLen / 2];
         }
     };
 
@@ -584,18 +615,14 @@ private:
 
         if (isPickAttack)
         {
-            attackBlankFrames = 5; // ~100 мс глобальной блокировки переходного процесса боя по струнам
+            attackBlankFrames = 5; // ~100 мс глобальной блокировки щелчка атаки
             for (int s = 0; s < numConfiguredStrings; ++s)
             {
                 auto& ch           = channels[static_cast<std::size_t> (s)];
                 ch.framesSincePeak = 0;
                 ch.peakEnergy      = 0.0f;
                 if (ch.harmOrder > 1)
-                {
-                    ch.ringCount     = 0;
-                    ch.ringWriteIdx  = 0;
-                    ch.lockAgeFrames = 0;
-                }
+                    ch.trimOldPeriods (4);
             }
         }
         else if (attackBlankFrames > 0)
@@ -616,8 +643,8 @@ private:
                                  ? std::sqrt (ch.energySum / static_cast<float> (ch.energySamples))
                                  : 0.0f;
 
-            // Поканальная детекция щипка конкретной струны (учитывает задержку 40..80 мс при бое медиатором от 6-й к 1-й струне)
-            const bool chAttack = (r > ch.rawRmsSmooth * 1.45f) && (r > 0.00022f);
+            // Поканальная детекция щипка конкретной струны
+            const bool chAttack = (r > ch.rawRmsSmooth * 1.50f) && (r > 0.00025f);
 
             if (r > ch.rawRmsSmooth)
                 ch.rawRmsSmooth = ch.rawRmsSmooth * 0.30f + r * 0.70f;
@@ -627,15 +654,11 @@ private:
 
             if (chAttack)
             {
-                ch.channelBlankFrames = 3; // ~60 мс пропуска щелчка медиатора по данной струне
+                ch.channelBlankFrames = 4; // ~80 мс пропуска пикового всплеска натяжения сразу после щипка
                 ch.peakEnergy         = ch.rawRmsSmooth;
                 ch.framesSincePeak    = 0;
                 if (ch.harmOrder > 1)
-                {
-                    ch.ringCount     = 0;
-                    ch.ringWriteIdx  = 0;
-                    ch.lockAgeFrames = 0;
-                }
+                    ch.trimOldPeriods (4);
             }
             else
             {
@@ -647,6 +670,8 @@ private:
                 {
                     if (ch.rawRmsSmooth > ch.peakEnergy)
                         ch.peakEnergy = ch.rawRmsSmooth;
+                    else
+                        ch.peakEnergy *= 0.992f; // плавная адаптация огибающей к плато сустейна после спада пика атаки
                     ++ch.framesSincePeak;
                 }
             }
@@ -788,13 +813,18 @@ private:
             const auto idx = static_cast<std::size_t> (s);
             auto& ch       = channels[idx];
 
-            // Динамический режекторный фильтр (Notch) для 2-й струны (2*f2 = 466..494 Гц):
-            // Если 6-я струна (colliding3xIdx) расстроена более чем на 2.5 цента, её 6-я гармоника (6*f6)
-            // смещается и точно вырезается узким Notch-фильтром (Q = 18.0), чтобы 6-я струна никогда не тянула 2-ю!
+            // Двусторонний динамический режекторный фильтр (Notch) для 2-й струны (2*f2 = 466..494 Гц):
+            // Вырезаем 6-ю гармонику 6-й струны (6*f6) как при расстроенной 6-й струне, так и при расстроенной 2-й струне
+            // (когда |cents[2] - cents[6]| > 2.5 цента), чтобы 2-я струна свободно отслеживала откат после атаки и подстройку колком!
             if (ch.harmOrder == 2 && ch.colliding3xIdx >= 0)
             {
-                const auto& lowCh = channels[static_cast<std::size_t> (ch.colliding3xIdx)];
-                if (lowCh.hasCentsInit && std::abs (lowCh.smoothedCents) > 2.5f)
+                const auto lowIdx = static_cast<std::size_t> (ch.colliding3xIdx);
+                const auto& lowCh = channels[lowIdx];
+                const bool lowStringRinging = (rawRms[lowIdx] > absFloor * 3.0f);
+                const bool pitchSeparated   = lowCh.hasCentsInit &&
+                                              (std::abs (lowCh.smoothedCents) > 2.5f ||
+                                               (ch.hasCentsInit && std::abs (ch.smoothedCents - lowCh.smoothedCents) > 2.5f));
+                if (lowStringRinging && pitchSeparated)
                 {
                     const float lowActualHz = lowCh.targetFreqHz * std::pow (2.0f, lowCh.smoothedCents / 1200.0f);
                     ch.setNotchFilter (lowActualHz * 6.0f, 18.0f);
@@ -817,15 +847,25 @@ private:
                 float iqrSpreadCents = 0.0f;
                 const float stablePeriod = ch.computeStablePeriod (iqrSpreadCents);
 
-                // Для тонких струн без обмотки (harmOrder > 1, 1-я и 2-я струны), которые затухают быстрее толстых басовых струн,
-                // обновляем оценку высоты тона только в первые ~560 мс (28 кадров) после пика удара по струне,
-                // пока энергия струны составляет >= 34% от её пика. На хвосте сустейна значение фиксируется,
-                // чтобы обертоны долго звучащей 6-й струны (при вращении её колка) не влияли на 1-ю и 2-ю струны!
-                const bool isBlanked   = (attackBlankFrames > 0) || (ch.channelBlankFrames > 0);
+                const bool isBlanked = (attackBlankFrames > 0) || (ch.channelBlankFrames > 0);
+
+                // Проверяем, не затухла ли тонкая струна (1 или 2) полностью на фоне ещё гудящей 6-й струны:
+                // пока энергия тонкой струны >= 10% от её плавно адаптирующегося пика ИЛИ пока она соизмерима с басовой струной,
+                // разрешаем непрерывное обновление на протяжении всего сустейна (~2.2+ секунды), чтобы видеть откат и крутить колок!
+                bool bassSwamping = false;
+                const int lowRefIdx = (ch.colliding3xIdx >= 0) ? ch.colliding3xIdx : ch.colliding4xIdx;
+                if (ch.harmOrder > 1 && lowRefIdx >= 0)
+                {
+                    const float lowRms = rawRms[static_cast<std::size_t> (lowRefIdx)];
+                    // Блокируем только в самом конце затухания тонкой струны (> 1.6 с после удара), если 6-я струна в 3+ раза громче
+                    if (ch.framesSincePeak > 80 && lowRms > ch.rawRmsSmooth * 3.0f && ch.rawRmsSmooth < ch.peakEnergy * 0.16f)
+                        bassSwamping = true;
+                }
+
                 const bool allowUpdate = (ch.harmOrder > 1)
-                                             ? (!isBlanked && ch.framesSincePeak <= 28 && ch.rawRmsSmooth >= ch.peakEnergy * 0.34f)
+                                             ? (!isBlanked && !bassSwamping && ch.framesSincePeak <= 115 && ch.rawRmsSmooth >= ch.peakEnergy * 0.10f)
                                              : (!isBlanked && ch.rawRmsSmooth >= ch.peakEnergy * 0.08f);
-                const float maxIqr     = (ch.harmOrder > 1) ? 5.5f : 8.0f;
+                const float maxIqr     = (ch.harmOrder > 1) ? 6.5f : 8.0f;
 
                 if (allowUpdate && iqrSpreadCents < maxIqr)
                 {
@@ -842,11 +882,23 @@ private:
                     else
                     {
                         ++ch.lockAgeFrames;
-                        const float coherenceWeight = (iqrSpreadCents < 3.5f) ? 1.0f : 0.55f;
-                        if (ch.lockAgeFrames <= 6)
+                        const float coherenceWeight = (iqrSpreadCents < 3.5f) ? 1.0f : 0.60f;
+
+                        if (ch.harmOrder > 1)
                         {
-                            const float fastAlpha = (ch.harmOrder > 1) ? 0.55f : 0.35f;
-                            ch.smoothedCents += (clampedC - ch.smoothedCents) * (fastAlpha * coherenceWeight);
+                            // Двухфазное отслеживание для тонких струн (1 и 2):
+                            // 1) В первые ~140 мс после щипка (framesSincePeak <= 7), пока струна завышена из-за пикового натяжения атаки,
+                            //    используем умеренный коэффициент (0.16), чтобы не прыгать на пик атаки.
+                            // 2) Начиная со ~160 мс (framesSincePeak > 7), когда струна откатывает к истинной высоте тона и музыкант
+                            //    подстраивает колок, включаем быстрое отслеживание (0.28..0.34), чтобы плавно и точно ловить откат и вращение колка!
+                            const float settleAlpha = (ch.framesSincePeak <= 7)
+                                                          ? 0.16f
+                                                          : ((ch.framesSincePeak <= 45) ? 0.30f : (0.14f + curve * 0.18f));
+                            ch.smoothedCents += (clampedC - ch.smoothedCents) * (settleAlpha * coherenceWeight);
+                        }
+                        else if (ch.lockAgeFrames <= 6)
+                        {
+                            ch.smoothedCents += (clampedC - ch.smoothedCents) * (0.35f * coherenceWeight);
                         }
                         else
                         {
